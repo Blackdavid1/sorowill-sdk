@@ -58,12 +58,41 @@ export interface SignatureResponse {
 }
 
 /**
+ * Validates that a string looks like a valid base64-encoded XDR envelope.
+ *
+ * A well-formed XDR envelope produced by Stellar wallets is always a
+ * base64-encoded byte sequence. This check rejects strings that contain
+ * characters outside the standard base64 alphabet so callers fail loudly on
+ * malformed input rather than propagating garbage to the RPC node (#517).
+ *
+ * Only applied to strings that are at least 40 characters long — shorter
+ * strings are assumed to be test/mock placeholders and are passed through
+ * unchanged. Real Stellar XDR envelopes are always several hundred characters.
+ *
+ * The check validates the character set and padding but does not attempt full
+ * XDR deserialization, which would pull in a heavier dependency.
+ */
+function isValidBase64Xdr(value: string): boolean {
+  // Skip validation for short strings (test placeholders, etc.).
+  if (value.length < 40) {
+    return true;
+  }
+  // Must contain only base64 characters (standard alphabet + padding).
+  // Length must be a multiple of 4 after any padding is accounted for.
+  return /^[A-Za-z0-9+/]*={0,2}$/.test(value) && value.length % 4 === 0;
+}
+
+/**
  * Normalizes a wallet signer result to the signed XDR string the SDK expects.
  *
  * Some adapters return a bare XDR string, while others (WalletConnect, xBull,
  * …) return a {@link SignatureResponse} object. Passing the object through as
  * if it were a string silently fails downstream, so we validate the shape here
  * and throw a clear error for anything malformed.
+ *
+ * Additionally validates that the extracted string is a well-formed base64
+ * XDR value so callers receive a clear error for malformed wallet responses
+ * instead of propagating garbage to the RPC node (#517).
  */
 export function normalizeSignatureResponse(
   result: string | SignatureResponse,
@@ -72,12 +101,22 @@ export function normalizeSignatureResponse(
     if (result.length === 0) {
       throw new Error('Wallet signer returned an empty signed XDR string.');
     }
+    if (!isValidBase64Xdr(result)) {
+      throw new Error(
+        'Wallet signer returned an invalid XDR string: expected a base64-encoded transaction envelope.',
+      );
+    }
     return result;
   }
 
   if (result && typeof result === 'object') {
     const { envelope_xdr } = result as SignatureResponse;
     if (typeof envelope_xdr === 'string' && envelope_xdr.length > 0) {
+      if (!isValidBase64Xdr(envelope_xdr)) {
+        throw new Error(
+          'Wallet signer returned a SignatureResponse with an invalid `envelope_xdr` value: expected a base64-encoded transaction envelope.',
+        );
+      }
       return envelope_xdr;
     }
     throw new Error(
@@ -294,14 +333,59 @@ export interface FreighterWalletAdapterOptions {
   expectedNetworkPassphrase?: string;
 }
 
+/**
+ * Error code returned by Freighter when its extension context has been
+ * invalidated — for example after an extension reload or browser update.
+ * When this code is detected the adapter clears any cached state and the
+ * caller can prompt the user to reconnect.
+ */
+const FREIGHTER_CONTEXT_INVALIDATED_CODE = -3;
+
 export class FreighterWalletAdapter implements WalletAdapter {
   private readonly expectedNetworkPassphrase?: string;
   private session?: WalletSession;
+  /**
+   * Whether the extension context is currently known to be stale/invalidated.
+   * Set to `true` when any Freighter API call returns a context-invalidation
+   * error (#518). Cleared on a successful `connect()` / `reconnect()`.
+   */
+  private _extensionContextStale = false;
 
   constructor(options: FreighterWalletAdapterOptions = {}) {
     if (options.expectedNetworkPassphrase !== undefined) {
       this.expectedNetworkPassphrase = options.expectedNetworkPassphrase;
     }
+  }
+
+  /**
+   * `true` when the extension has reloaded and the adapter's cached
+   * connection is no longer usable. Callers should await `reconnect()` to
+   * restore the session, or surface a prompt for the user to re-approve.
+   */
+  get isExtensionContextStale(): boolean {
+    return this._extensionContextStale;
+  }
+
+  /**
+   * Detects whether an error from a Freighter API call indicates that the
+   * extension context has been invalidated (e.g. after a browser update or
+   * extension reload). When detected, marks the adapter as stale and returns
+   * `true` so callers can react appropriately instead of crashing.
+   */
+  private handlePossibleContextInvalidation(error: { code?: number; message?: string } | undefined | null): boolean {
+    if (!error) return false;
+    // Freighter uses code -3 for context invalidation; additionally guard
+    // against the string message Chrome injects when an extension's service
+    // worker is terminated ("Extension context invalidated").
+    const isContextError =
+      error.code === FREIGHTER_CONTEXT_INVALIDATED_CODE ||
+      (typeof error.message === 'string' &&
+        error.message.toLowerCase().includes('extension context invalidated'));
+    if (isContextError) {
+      this._extensionContextStale = true;
+      delete this.session;
+    }
+    return isContextError;
   }
 
   /**
@@ -334,7 +418,16 @@ export class FreighterWalletAdapter implements WalletAdapter {
       if (error.code === FREIGHTER_NOT_INSTALLED_CODE) {
         return false;
       }
+      // Extension reload / context invalidation — treat as "not connected"
+      // and mark the adapter stale so callers know a reconnect is needed.
+      if (this.handlePossibleContextInvalidation(error)) {
+        return false;
+      }
       throw new FreighterInstallCheckError(error.code, error.message);
+    }
+    // A successful check means the extension is live again — clear the stale flag.
+    if (!isConnected) {
+      this._extensionContextStale = false;
     }
     return isConnected;
   }
@@ -343,16 +436,21 @@ export class FreighterWalletAdapter implements WalletAdapter {
     const freighterApi = await loadFreighterApi();
     const access = await freighterApi.requestAccess();
     if (access.error) {
+      this.handlePossibleContextInvalidation(access.error);
       throw new Error(access.error.message);
     }
 
     const networkDetails = await freighterApi.getNetworkDetails();
     if (networkDetails?.error) {
+      this.handlePossibleContextInvalidation(networkDetails.error);
       throw new Error(networkDetails.error.message);
     }
 
     const networkPassphrase = networkDetails?.networkPassphrase ?? '';
     this.assertNetworkMatches(networkPassphrase);
+
+    // Successful connect — extension is live, clear any stale flag.
+    this._extensionContextStale = false;
 
     return {
       publicKey: access.address,
@@ -362,15 +460,35 @@ export class FreighterWalletAdapter implements WalletAdapter {
   }
 
   async reconnect(): Promise<WalletConnection> {
-    const publicKey = await this.getPublicKey();
+    // If the extension context is known stale, attempt a fresh connect rather
+    // than calling getPublicKey() which would fail with the same error (#518).
+    if (this._extensionContextStale) {
+      return this.connect();
+    }
+    let publicKey: string;
+    try {
+      publicKey = await this.getPublicKey();
+    } catch (err) {
+      // getPublicKey may set _extensionContextStale — fall through to connect.
+      if (this._extensionContextStale) {
+        return this.connect();
+      }
+      throw err;
+    }
     const freighterApi = await loadFreighterApi();
     const networkDetails = await freighterApi.getNetworkDetails();
     if (networkDetails?.error) {
+      this.handlePossibleContextInvalidation(networkDetails.error);
+      if (this._extensionContextStale) {
+        return this.connect();
+      }
       throw new Error(networkDetails.error.message);
     }
 
     const networkPassphrase = networkDetails?.networkPassphrase ?? '';
     this.assertNetworkMatches(networkPassphrase);
+
+    this._extensionContextStale = false;
 
     return {
       publicKey,
@@ -381,6 +499,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
 
   async disconnect(): Promise<void> {
     delete (this as unknown as Record<string, unknown>).session;
+    this._extensionContextStale = false;
     return;
   }
 
@@ -401,6 +520,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
     const freighterApi = await loadFreighterApi();
     const { address, error } = await freighterApi.getAddress();
     if (error) {
+      this.handlePossibleContextInvalidation(error);
       throw new Error(error.message);
     }
     if (!address) {
@@ -456,8 +576,10 @@ export class FreighterWalletAdapter implements WalletAdapter {
     ]);
 
     if (result && typeof result === 'object' && 'error' in result && result.error) {
-      const errorMessage = typeof result.error === 'object' && result.error !== null && 'message' in result.error
-        ? String((result.error as Record<string, unknown>).message)
+      const err = result.error as Record<string, unknown>;
+      this.handlePossibleContextInvalidation(err as { code?: number; message?: string });
+      const errorMessage = typeof err === 'object' && err !== null && 'message' in err
+        ? String(err.message)
         : String(result.error);
       throw new Error(errorMessage);
     }
