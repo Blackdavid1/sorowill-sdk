@@ -12,14 +12,35 @@ export interface CachePersistenceAdapter {
   clear(): Promise<void>;
 }
 
+// Share the lock across caches using the same adapter. Serialize all mutations,
+// since adapters may store every key in one read-modify-write document.
+const persistenceLocks = new WeakMap<CachePersistenceAdapter, Promise<void>>();
+
+function withPersistenceLock(
+  adapter: CachePersistenceAdapter,
+  operation: () => Promise<void>,
+): Promise<void> {
+  const previous = persistenceLocks.get(adapter) ?? Promise.resolve();
+  const result = previous.then(operation);
+  // A failed mutation must release the lock so later writes can still proceed.
+  const tail = result.catch(() => {});
+  persistenceLocks.set(adapter, tail);
+  void tail.then(() => {
+    if (persistenceLocks.get(adapter) === tail) persistenceLocks.delete(adapter);
+  });
+  return result;
+}
+
 export interface ReadCacheOptions {
   ttlMs?: number;
   now?: () => number;
   persistence?: CachePersistenceAdapter;
   /**
    * Maximum number of entries to keep in the cache. When the number of entries
-   * exceeds this limit, the least-recently-used entries are evicted (and removed
-   * from persistence). When omitted, the cache is unbounded.
+   * exceeds this limit, expired entries are pruned first and then the
+   * least-recently-used entries are evicted (and removed from persistence).
+   * Defaults to {@link DEFAULT_MAX_CACHE_ENTRIES}. Pass `Infinity` to opt into
+   * an unbounded cache.
    */
   maxEntries?: number;
   /**
@@ -44,6 +65,21 @@ interface CacheEntry {
   willIds: Set<string>;
 }
 
+/**
+ * Returns `true` once `now` has reached `expiresAt` (the boundary itself
+ * counts as expired). A non-finite numeric `expiresAt` — e.g. a corrupted
+ * persisted entry — is treated as expired rather than as fresh forever.
+ */
+function isExpired(expiresAt: unknown, now: number): boolean {
+  if (expiresAt === null) {
+    return false;
+  }
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
+    return true;
+  }
+  return expiresAt <= now;
+}
+
 function serializeCacheValue(value: unknown): string {
   return JSON.stringify(value, function (key, currentValue) {
     // `Date` defines `toJSON`, so by the time a replacer sees it, it has
@@ -66,8 +102,7 @@ export function deserializeCacheValue<T>(value: string): T {
       currentValue &&
       typeof currentValue === 'object' &&
       '__type' in currentValue &&
-      'value' in currentValue &&
-      typeof currentValue.value === 'string'
+      'value' in currentValue
     ) {
       const type = currentValue.__type as string;
       if (type === 'bigint') {
@@ -106,10 +141,29 @@ function stableStringify(value: unknown): string {
 }
 
 /**
+ * Escapes special characters (such as colons, slashes, percent signs, and separators)
+ * in a cache key component to prevent cache key collisions when component IDs contain
+ * separators.
+ *
+ * @param component - The raw string component (e.g. method name or identifier)
+ * @returns The escaped component safe for use in cache keys
+ */
+export function escapeKeyComponent(component: string): string {
+  return encodeURIComponent(component);
+}
+
+/**
+ * Alias for {@link escapeKeyComponent}.
+ */
+export const escapeCacheKeyComponent = escapeKeyComponent;
+
+/**
  * Builds a locale-agnostic cache key for a read method.
  *
  * Cache key design:
- * - Keys are derived ONLY from the method name and its non-locale arguments.
+ * - Keys are derived from the escaped method name and its stably serialized arguments.
+ * - Special characters in component IDs (such as colons and separators) are escaped
+ *   via {@link escapeKeyComponent} to prevent cache key collisions.
  * - Locale-dependent inputs (e.g. `locale`, `language`, `i18n`) are stripped
  *   before serialization so the same underlying data maps to a single key
  *   regardless of the active language.
@@ -117,10 +171,10 @@ function stableStringify(value: unknown): string {
  *   applied AFTER retrieving the cached value, never before caching it.
  *
  * This guarantees that switching languages mid-app does not return stale data
- * formatted for the previous locale.
+ * formatted for the previous locale and eliminates collision vulnerabilities.
  */
 export function createReadCacheKey(method: string, args: Record<string, unknown>): string {
-  return `${method}:${stableStringify(args)}`;
+  return `${escapeKeyComponent(method)}:${stableStringify(args)}`;
 }
 
 /**
@@ -151,6 +205,13 @@ export class ReadCache {
   private readonly rollbackOnPersistenceFailure: boolean;
   private readonly readyPromise: Promise<void>;
   /**
+   * Will-ID to cache-key index. Maps each will ID to the set of cache keys
+   * whose entries reference that will ID, so reads and invalidations address
+   * the same entries and eviction can clean up associated references
+   * instead of leaking them.
+   */
+  private readonly willIdToKeys = new Map<string, Set<string>>();
+  /**
    * Keys written or deleted after construction but before hydration completes.
    * Hydration must not overwrite these with older persisted values.
    */
@@ -160,6 +221,12 @@ export class ReadCache {
    * repopulate the cache once it resolves.
    */
   private clearedBeforeHydration = false;
+  /**
+   * Network passphrase the cached entries belong to. Entries read on one
+   * network are meaningless on another, so switching networks clears the
+   * cache (see {@link ReadCache.setNetwork}).
+   */
+  private networkPassphrase: string | undefined;
 
   constructor(options: ReadCacheOptions = {}) {
     const ttlMs = options.ttlMs ?? 60_000;
@@ -183,6 +250,16 @@ export class ReadCache {
     this.readyPromise = this.hydrate();
   }
 
+  /** Number of entries currently held in memory (expired entries included until pruned). */
+  get size(): number {
+    return this.entries.size;
+  }
+
+  /** Configured maximum number of entries before LRU eviction kicks in. */
+  get capacity(): number {
+    return this.maxEntries;
+  }
+
   async ready(): Promise<void> {
     await this.readyPromise;
   }
@@ -195,6 +272,10 @@ export class ReadCache {
    * `ready()` completes will return undefined for entries that are currently
    * being loaded from persistent storage.
    *
+   * The entry's expiration is checked on every retrieval: an entry whose
+   * `expiresAt` has been reached is never returned, and is invalidated both
+   * in memory and in persistent storage so it can't be served again (#620).
+   *
    * @param key - The cache key to look up
    * @returns The cached value if found and not expired, or undefined
    */
@@ -204,8 +285,8 @@ export class ReadCache {
       return undefined;
     }
 
-    if (entry.expiresAt !== null && entry.expiresAt <= this.now()) {
-      this.entries.delete(key);
+    if (isExpired(entry.expiresAt, this.now())) {
+      this.invalidateExpired(key);
       return undefined;
     }
 
@@ -233,6 +314,15 @@ export class ReadCache {
     };
 
     this.touchedKeys.add(key);
+    // Index the key under each will ID so invalidation by will ID can find it.
+    for (const willId of entry.willIds) {
+      let keys = this.willIdToKeys.get(willId);
+      if (!keys) {
+        keys = new Set();
+        this.willIdToKeys.set(willId, keys);
+      }
+      keys.add(key);
+    }
     // Delete before set so an updated key moves to the most-recent position.
     this.entries.delete(key);
     this.entries.set(key, entry);
@@ -247,6 +337,7 @@ export class ReadCache {
           this.touchedKeys.delete(key);
         }
       });
+    }
 
     this.evictIfNeeded();
   }
@@ -269,13 +360,34 @@ export class ReadCache {
     await this.readyPromise;
 
     const keysToDelete: string[] = [];
-    for (const [key, entry] of this.entries) {
-      if (entry.willIds.has(willId)) {
-        keysToDelete.push(key);
-      }
+    const keys = this.willIdToKeys.get(willId);
+    if (keys) {
+      keys.forEach((key) => keysToDelete.push(key));
     }
 
     await Promise.all(keysToDelete.map((key) => this.delete(key)));
+  }
+
+  /** Returns the network passphrase the cache is currently scoped to, if any. */
+  getNetwork(): string | undefined {
+    return this.networkPassphrase;
+  }
+
+  /**
+   * Scopes the cache to `networkPassphrase`. If the cache was already scoped
+   * to a different network (e.g. the wallet switched testnet ↔ mainnet), every
+   * entry is cleared so data read on the previous network is never served.
+   *
+   * @returns `true` if the network changed and the cache was cleared.
+   */
+  setNetwork(networkPassphrase: string): boolean {
+    const changed =
+      this.networkPassphrase !== undefined && this.networkPassphrase !== networkPassphrase;
+    this.networkPassphrase = networkPassphrase;
+    if (changed) {
+      this.clear();
+    }
+    return changed;
   }
 
   clear(): void {
@@ -287,10 +399,20 @@ export class ReadCache {
   }
 
   private evictIfNeeded(): void {
-    if (this.maxEntries === undefined) {
+    if (this.entries.size <= this.maxEntries) {
       return;
     }
 
+    // Drop expired entries first so live data is not evicted in their place.
+    const now = this.now();
+    for (const [key, entry] of this.entries) {
+      if (entry.expiresAt !== null && entry.expiresAt <= now) {
+        this.removeEvicted(key);
+      }
+    }
+
+    // Map iteration order is insertion order, and get()/set() re-insert on
+    // access, so the first key is always the least-recently-used one.
     while (this.entries.size > this.maxEntries) {
       const oldestKey = this.entries.keys().next().value;
       if (oldestKey === undefined) {
@@ -303,6 +425,16 @@ export class ReadCache {
         ?.delete(oldestKey)
         .catch((err) => this.onPersistenceFailure?.(oldestKey, err));
     }
+  }
+
+  /** Drops an expired entry from memory and, best-effort, from persistence. */
+  private invalidateExpired(key: string): void {
+    this.touchedKeys.add(key);
+    this.entries.delete(key);
+    void this.persistence?.delete(key).catch(() => {
+      // Silently ignore persistence failures to prevent unhandled rejections
+      // The entry is already gone in-memory and hydration skips expired entries
+    });
   }
 
   private async delete(key: string): Promise<void> {
@@ -329,28 +461,57 @@ export class ReadCache {
     }
 
     const now = this.now();
+    // Entries written while hydration was in flight are more recent than
+    // anything persisted, so they are moved behind the hydrated entries below
+    // to keep LRU order correct.
+    const writtenDuringHydration = Array.from(this.entries.values());
 
     for (const persistedEntry of persistedEntries) {
-      if (persistedEntry.expiresAt !== null && persistedEntry.expiresAt <= now) {
-        await this.persistence.delete(persistedEntry.key);
-        continue;
-      }
-
-      // Never let an older persisted entry replace a value that was written
-      // (or deleted) after construction but before hydration completed.
+      // Check before expiry cleanup too: an old expired entry must not delete
+      // a fresh write made while hydration was in flight.
       if (this.touchedKeys.has(persistedEntry.key)) {
         continue;
       }
+      if (persistedEntry.expiresAt !== null && persistedEntry.expiresAt <= now) {
+        await this.persist((adapter) => adapter.delete(persistedEntry.key));
+        continue;
+      }
 
-      this.entries.set(persistedEntry.key, {
+      const entry: CacheEntry = {
         key: persistedEntry.key,
-        value: deserializeCacheValue(persistedEntry.value),
+        value,
         expiresAt: persistedEntry.expiresAt,
         willIds: new Set(persistedEntry.willIds),
-      });
+      };
+
+      // Rebuild the will-ID index from persisted entries.
+      for (const willId of entry.willIds) {
+        let keys = this.willIdToKeys.get(willId);
+        if (!keys) {
+          keys = new Set();
+          this.willIdToKeys.set(willId, keys);
+        }
+        keys.add(persistedEntry.key);
+      }
+
+      this.entries.set(persistedEntry.key, entry);
+    }
+
+    for (const entry of writtenDuringHydration) {
+      // Skip entries replaced or removed while expired entries were deleted.
+      if (this.entries.get(entry.key) !== entry) {
+        continue;
+      }
+      this.entries.delete(entry.key);
+      this.entries.set(entry.key, entry);
     }
 
     this.evictIfNeeded();
+  }
+
+  private persist(operation: (adapter: CachePersistenceAdapter) => Promise<void>): Promise<void> {
+    const adapter = this.persistence;
+    return adapter ? withPersistenceLock(adapter, () => operation(adapter)) : Promise.resolve();
   }
 
   private toPersistedEntry(entry: CacheEntry): PersistedCacheEntry {

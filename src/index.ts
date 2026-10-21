@@ -20,6 +20,13 @@ export type {
   SoroWillReadCacheOptions,
 } from './SoroWillClient';
 export { DEFAULT_CONTRACT_IDS } from './SoroWillClient';
+export {
+  SDK_REQUIRED_CONTRACT_METHODS,
+  computeContractSpecVersion,
+  describeContractVersionMismatch,
+  readContractMeta,
+} from './contractVersion';
+export type { ContractSpecVersion } from './contractVersion';
 
 export { HookManager } from './hooks';
 export type {
@@ -42,6 +49,10 @@ export type {
 
 export {
   buildFeeBumpXdr,
+  estimateFeeBumpFee,
+  isFeeEstimateStale,
+  refreshFeeEstimateIfStale,
+  DEFAULT_FEE_STALENESS_THRESHOLD_MS,
   signFeeBumpXdr,
   submitFeeBump,
   submitFeeBumpTransaction,
@@ -49,32 +60,51 @@ export {
   StaleTransactionSequenceError,
 } from './feeBump';
 export type {
+  EstimateFeeBumpFeeOptions,
   FeeBumpOptions,
+  FeeEstimate,
   SubmitFeeBumpOptions,
 } from './feeBump';
 
-export { SimulationResultError } from './txValidation';
+export {
+  SimulationResultError,
+  UnsupportedSignatureAlgorithmError,
+  assertSupportedSignatureAlgorithm,
+  assertSignedTransactionXdrSignatures,
+  ED25519_SIGNATURE_LENGTH,
+} from './txValidation';
 export type {
   SimulationResponse,
   TransactionMatchOptions,
+  SignatureValidationOptions,
+  SignedTransactionLike,
 } from './txValidation';
 
 export type {
   BatchOperation,
+  BatchOperationResult,
+  BatchOperationStatus,
+  BatchQueueOptions,
+  BatchQueueResult,
   BatchResult,
   Beneficiary,
   CreateWillParams,
+  EmergencyCheckInOptions,
   PaginatedWillsResult,
   PaginationOptions,
   RequestOptions,
   SoroWillEvent,
+  SorobanEventType,
   UpdateBeneficiariesParams,
   Will,
 } from './types';
-export { WillStatus, WillErrorCode } from './types';
+export { SOROBAN_EVENT_TYPES, WillStatus, WillErrorCode } from './types';
 
 export {
   FreighterWalletAdapter,
+  WalletSessionError,
+  WalletSessionExpiredError,
+  assertWalletSessionActive,
   connectWallet,
   freighterAdapter,
   getDefaultWalletAdapter,
@@ -102,6 +132,7 @@ export {
   MemoryWalletConnectSessionStore,
   WalletConnectAdapter,
   WalletConnectTimeoutError,
+  WalletConnectUnsupportedMethodError,
 } from './walletConnect';
 export type {
   WalletConnectAdapterOptions,
@@ -113,17 +144,22 @@ export type {
 } from './walletConnect';
 
 export {
+  CacheDeserializationError,
   IndexedDbCachePersistenceAdapter,
   LocalStorageCachePersistenceAdapter,
   MemoryCachePersistenceAdapter,
+  DEFAULT_MAX_CACHE_ENTRIES,
   ReadCache,
   createReadCacheKey,
+  escapeCacheKeyComponent,
+  escapeKeyComponent,
 } from './cache';
 export type { CachePersistenceAdapter, PersistedCacheEntry, ReadCacheOptions } from './cache';
 
 export {
   addEventListener,
   unsubscribeFromWillEvents,
+  validateEventTypeFilter,
 } from './events';
 export type {
   WillEvent,
@@ -136,6 +172,7 @@ export {
   AccountNotFundedError,
   AlreadyClaimedError,
   AlreadyVotedError,
+  BatchNetworkMismatchError,
   BeneficiaryNotFoundError,
   BeneficiaryValidationError,
   CheckinNotDueError,
@@ -147,14 +184,17 @@ export {
   ExorbitantFeeError,
   FixedAmountExceedsBalanceError,
   FreighterInstallCheckError,
+  FreighterNotAvailableError,
   GracePeriodExpiredError,
   GracePeriodNotExpiredError,
   GuardianCooldownActiveError,
   HookExecutionError,
   HookRecursionError,
   InsufficientBalanceError,
+  InvalidBeneficiaryAddressError,
   InvalidContractIdError,
   InvalidDayCountError,
+  InvalidGuardianSignatureError,
   InvalidGuardianThresholdError,
   InvalidPaginationOptionsError,
   InvalidPercentageError,
@@ -163,7 +203,9 @@ export {
   InvalidPreimageError,
   InvalidPublicKeyError,
   InvalidSecretKeyError,
+  InvalidSignedXdrEncodingError,
   InvalidSplitError,
+  InvalidStellarAddressError,
   InvalidTokenError,
   InvalidTransactionXdrError,
   InvokeFailedError,
@@ -208,7 +250,7 @@ export {
   UnsupportedBatchSizeError,
   UnknownContractErrorCodeError,
 } from './errors';
-export type { ContractErrorFactory } from './errors';
+export type { ContractErrorFactory, InvalidStellarAddressReason } from './errors';
 
 export {
   DEFAULT_MAX_QUEUE_SIZE,
@@ -216,8 +258,14 @@ export {
   RequestPriority,
   getSharedRequestQueue,
   releaseSharedRequestQueue,
+  computeBackoffDelay,
+  isRateLimitError,
+  MAX_BACKOFF_MS,
 } from './requestQueue';
 export type { RequestQueueOptions } from './requestQueue';
+
+export { DebugLogger, DEFAULT_REDACTED_KEYS, REDACTED } from './debugLogger';
+export type { DebugLoggerOptions } from './debugLogger';
 
 export { buildSep7TxUri, parseSep7Callback } from './sep7';
 export { SEP7_MAX_ENVELOPE_BYTES, SEP7_MAX_URI_LENGTH } from './sep7';
@@ -242,22 +290,27 @@ export type {
 export {
   MAX_BENEFICIARIES,
   MAX_GUARDIANS,
+  assertValidStellarAddress,
   calculateShares,
   deepFreezeObject,
   formatDeadline,
   formatTokenAmount,
   formatUSDC,
   getNextActionableState,
+  getStellarAddressError,
   getTimeUntilCheckin,
   hasDuplicateBeneficiaries,
   isBeneficiary,
   isCheckinDue,
   isGuardian,
+  isValidStellarAddress,
   toStroops,
   validateBeneficiaries,
+  describeInvalidBeneficiaryAddress,
+  assertValidBeneficiaryAddresses,
   validateGuardians,
 } from './utils';
-export type { NextActionableState } from './utils';
+export type { NextActionableState, StellarAddressValidationOptions } from './utils';
 
 export {
   DEFAULT_NETWORK,

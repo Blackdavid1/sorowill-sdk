@@ -1,6 +1,10 @@
 import { StrKey } from '@stellar/stellar-sdk';
 
-import { BeneficiaryValidationError } from './errors';
+import {
+  BeneficiaryValidationError,
+  InvalidStellarAddressError,
+  type InvalidStellarAddressReason,
+} from './errors';
 import type { Beneficiary, Will } from './types';
 import { WillStatus } from './types';
 
@@ -199,7 +203,7 @@ export function isCheckinDue(will: Will): boolean {
  */
 export function calculateShares(
   balance: string,
-  beneficiaries: Beneficiary[],
+  beneficiaries: readonly Beneficiary[],
 ): Array<{ address: string; share: string }> {
   const total = BigInt(balance);
   let remaining = total;
@@ -222,7 +226,7 @@ export function calculateShares(
  * {@link calculateShares}, so the rounding remainder is attributed correctly.
  */
 export function tagOnChainOrder(
-  beneficiaries: Beneficiary[],
+  beneficiaries: readonly Beneficiary[],
 ): Array<Beneficiary & { onChainIndex: number }> {
   return beneficiaries.map((beneficiary, onChainIndex) => ({ ...beneficiary, onChainIndex }));
 }
@@ -258,6 +262,69 @@ export const MAX_BENEFICIARIES = 10;
  */
 export const MAX_GUARDIANS = 3;
 
+/** Length of a StrKey-encoded Stellar account address. */
+const STELLAR_ADDRESS_LENGTH = 56;
+
+/**
+ * Returns a human-readable reason why `address` is not a valid Stellar
+ * account address usable as a beneficiary, or `null` when it is valid.
+ *
+ * Only Ed25519 account addresses (`G...`) are accepted. Contract (`C...`)
+ * and muxed (`M...`) addresses, secret keys, and non-Stellar addresses (e.g.
+ * Ethereum `0x...`) are rejected with a specific reason.
+ */
+export function describeInvalidBeneficiaryAddress(address: unknown): string | null {
+  if (typeof address !== 'string') {
+    return `expected a string, received ${address === null ? 'null' : typeof address}`;
+  }
+  if (address.length === 0) {
+    return 'address is empty';
+  }
+  if (address.trim() !== address) {
+    return 'address contains leading or trailing whitespace';
+  }
+  if (/^0x[0-9a-fA-F]*$/.test(address)) {
+    return 'this looks like an Ethereum/EVM address, not a Stellar address';
+  }
+  if (address !== address.toUpperCase()) {
+    return 'Stellar addresses are uppercase';
+  }
+  if (StrKey.isValidEd25519SecretSeed(address)) {
+    return 'this is a secret key, not a public address — never share it';
+  }
+  if (StrKey.isValidContract(address)) {
+    return 'contract addresses ("C...") are not supported as beneficiaries';
+  }
+  if (StrKey.isValidMed25519PublicKey(address)) {
+    return 'muxed addresses ("M...") are not supported as beneficiaries';
+  }
+  if (!address.startsWith('G')) {
+    return 'Stellar account addresses start with "G"';
+  }
+  if (address.length !== STELLAR_ADDRESS_LENGTH) {
+    return `expected ${STELLAR_ADDRESS_LENGTH} characters, received ${address.length}`;
+  }
+  if (!StrKey.isValidEd25519PublicKey(address)) {
+    return 'checksum or encoding is invalid';
+  }
+  return null;
+}
+
+/**
+ * Asserts that every beneficiary address is a valid Stellar account address.
+ *
+ * @throws {InvalidBeneficiaryAddressError} For the first invalid address,
+ *   naming the address and the reason it was rejected.
+ */
+export function assertValidBeneficiaryAddresses(beneficiaries: Beneficiary[]): void {
+  for (const b of beneficiaries) {
+    const reason = describeInvalidBeneficiaryAddress(b?.address);
+    if (reason !== null) {
+      throw new InvalidBeneficiaryAddressError(b?.address, reason);
+    }
+  }
+}
+
 /**
  * Tolerance for floating-point percentage sums. Because binary floating-point
  * arithmetic can produce results like `99.99999999999999` instead of `100`,
@@ -282,11 +349,11 @@ export const PERCENTAGE_SUM_EPSILON = 1e-9;
  *   failures (empty list, too many entries, bad percentages, wrong sum)
  *   return `false` as before.
  */
-export function validateBeneficiaries(beneficiaries: Beneficiary[]): boolean {
+export function validateBeneficiaries(beneficiaries: readonly Beneficiary[]): boolean {
   if (beneficiaries.length === 0 || beneficiaries.length > MAX_BENEFICIARIES) {
     return false;
   }
-  if (!beneficiaries.every((b) => StrKey.isValidEd25519PublicKey(b.address))) {
+  if (!beneficiaries.every((b) => describeInvalidBeneficiaryAddress(b.address) === null)) {
     return false;
   }
   if (!beneficiaries.every((b) => typeof b.percentage === 'number' && b.percentage > 0)) {
@@ -318,7 +385,7 @@ export function validateBeneficiaries(beneficiaries: Beneficiary[]): boolean {
  * address (compared case-insensitively), which the contract rejects with
  * `WillError::DuplicateBeneficiary`.
  */
-export function hasDuplicateBeneficiaries(beneficiaries: Beneficiary[]): boolean {
+export function hasDuplicateBeneficiaries(beneficiaries: readonly Beneficiary[]): boolean {
   const addresses = new Set(beneficiaries.map((b) => b.address.toUpperCase()));
   return addresses.size !== beneficiaries.length;
 }
@@ -391,7 +458,7 @@ export function getNextActionableState(
 }
 
 export function validateGuardians(
-  guardians: string[],
+  guardians: readonly string[],
   ownerAddress?: string,
 ): boolean {
   if (!Array.isArray(guardians)) {

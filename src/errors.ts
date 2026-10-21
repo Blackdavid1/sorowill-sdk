@@ -100,10 +100,28 @@ export class SoroWillInvalidAmountError extends SoroWillError {
 /** Raised when an RPC call exceeds its configured deadline. */
 export class RequestTimeoutError extends SoroWillError {
   readonly timeoutMs: number;
+  /** The name of the method or operation that timed out, if known. */
+  readonly method?: string | undefined;
+  /** The operation name that timed out, alias for {@link method}. */
+  readonly operation?: string | undefined;
 
-  constructor(timeoutMs: number, options?: ErrorOptions) {
-    super(`SoroWill RPC request timed out after ${timeoutMs}ms`, options);
+  constructor(
+    timeoutMs: number,
+    methodOrOptions?: string | ErrorOptions,
+    options?: ErrorOptions,
+  ) {
+    const method = typeof methodOrOptions === 'string' ? methodOrOptions : undefined;
+    const errOptions =
+      typeof methodOrOptions === 'object' && methodOrOptions !== null
+        ? methodOrOptions
+        : options;
+    const message = method
+      ? `SoroWill RPC request for "${method}" timed out after ${timeoutMs}ms`
+      : `SoroWill RPC request timed out after ${timeoutMs}ms`;
+    super(message, errOptions);
     this.timeoutMs = timeoutMs;
+    this.method = method;
+    this.operation = method;
   }
 }
 
@@ -169,6 +187,28 @@ export class FreighterInstallCheckError extends SoroWillError {
   constructor(code: number, message: string, options?: ErrorOptions) {
     super(`Unable to determine whether Freighter is installed: ${message}`, options);
     this.code = code;
+  }
+}
+
+/**
+ * Raised by {@link FreighterWalletAdapter} when the Freighter extension has
+ * still not injected itself into the page (`window.freighter` /
+ * `window.stellar`) after every configured retry. Usually means Freighter is
+ * not installed, is disabled, or the page loaded before the extension could
+ * attach.
+ */
+export class FreighterNotAvailableError extends SoroWillError {
+  /** Number of injection checks performed before giving up. */
+  readonly attempts: number;
+
+  constructor(attempts: number, options?: ErrorOptions) {
+    super(
+      `Freighter is not available: the extension was not injected into the page after ${attempts} attempts. ` +
+        'Make sure Freighter is installed and enabled, then reload the page.',
+      options,
+    );
+    this.name = new.target.name;
+    this.attempts = attempts;
   }
 }
 
@@ -271,6 +311,48 @@ export class UnsupportedBatchSizeError extends SoroWillError {
 }
 
 /**
+ * Raised when the operations passed to {@link SoroWillClient.batch} do not all
+ * target the same Stellar network, or when the network they target differs
+ * from the network the client is configured for (#550).
+ *
+ * The check runs before any transaction is built, signed, or submitted, so a
+ * batch can never silently mix testnet and mainnet operations.
+ */
+export class BatchNetworkMismatchError extends SoroWillError {
+  /** The network the client is configured for. */
+  readonly clientNetwork: string;
+  /** The network the offending operation targets. */
+  readonly operationNetwork: string;
+  /** Index of the offending operation within the batch. */
+  readonly operationIndex: number;
+  /** Index of the operation declaring a conflicting network, when set. */
+  readonly conflictingOperationIndex: number | undefined;
+  /** The network declared by the conflicting operation, when set. */
+  readonly conflictingNetwork: string | undefined;
+
+  constructor(
+    clientNetwork: string,
+    operationNetwork: string,
+    operationIndex: number,
+    conflicting?: { operationIndex: number; network: string },
+    options?: ErrorOptions,
+  ) {
+    const message = conflicting
+      ? `Batch operations must all target the same network: operation ${operationIndex} targets ` +
+        `"${operationNetwork}" but operation ${conflicting.operationIndex} targets ` +
+        `"${conflicting.network}".`
+      : `Batch operation ${operationIndex} targets network "${operationNetwork}" but the client is ` +
+        `configured for "${clientNetwork}".`;
+    super(message, options);
+    this.clientNetwork = clientNetwork;
+    this.operationNetwork = operationNetwork;
+    this.operationIndex = operationIndex;
+    this.conflictingOperationIndex = conflicting?.operationIndex;
+    this.conflictingNetwork = conflicting?.network;
+  }
+}
+
+/**
  * Raised when the transaction XDR passed to {@link MultisigCollector} constructor
  * or {@link MultisigCollector.fromJSON} is not a syntactically valid Stellar
  * transaction envelope XDR. This includes malformed base64 or unsupported
@@ -286,6 +368,30 @@ export class InvalidTransactionXdrError extends SoroWillError {
         'Ensure the XDR is base64-encoded and represents a valid TransactionEnvelope (v1 or fee-bump).',
       options,
     );
+  }
+}
+
+/**
+ * Raised when a wallet signer returns a signed transaction that is not valid
+ * base64. Stellar transaction envelopes are always standard (RFC 4648),
+ * padded base64-encoded XDR, so anything else would only fail later — and
+ * far more cryptically — when the envelope is decoded or submitted to the
+ * contract.
+ *
+ * The offending value is intentionally not embedded in the message; only its
+ * length is kept so the error is safe to forward to error-tracking pipelines.
+ */
+export class InvalidSignedXdrEncodingError extends SoroWillError {
+  /** Length of the rejected XDR string. */
+  readonly length: number;
+
+  constructor(length: number, options?: ErrorOptions) {
+    super(
+      'Wallet signer returned a signed transaction XDR that is not valid base64. ' +
+        'Expected a standard, padded base64-encoded TransactionEnvelope.',
+      options,
+    );
+    this.length = length;
   }
 }
 
@@ -325,6 +431,31 @@ export class BeneficiaryValidationError extends SoroWillError {
 }
 
 /**
+ * Raised by {@link SoroWillClient.createWill} and
+ * {@link SoroWillClient.updateBeneficiaries} when a beneficiary address is not
+ * a valid Stellar account address (a `G...` Ed25519 public key). Catching it
+ * before submission prevents a will from being created whose funds can never
+ * be released to that beneficiary.
+ */
+export class InvalidBeneficiaryAddressError extends BeneficiaryValidationError {
+  /** The offending beneficiary address, exactly as supplied. */
+  readonly address: unknown;
+  /** Human-readable reason the address was rejected. */
+  readonly reason: string;
+
+  constructor(address: unknown, reason: string, options?: ErrorOptions) {
+    const shown = typeof address === 'string' ? `"${address}"` : String(address);
+    super(
+      `Invalid beneficiary address ${shown}: ${reason}. ` +
+        'Beneficiaries must be Stellar account addresses: 56-character uppercase strings starting with "G".',
+      options,
+    );
+    this.address = address;
+    this.reason = reason;
+  }
+}
+
+/**
  * Raised by `createWill` before any RPC call when the guardian list is
  * invalid: a malformed Stellar address, a duplicate entry, or the owner's own
  * address. `reason` names the problem and `guardian` the offending address.
@@ -351,6 +482,62 @@ export class GuardianValidationError extends SoroWillError {
   }
 }
 
+/** Why a value was rejected by {@link InvalidStellarAddressError}. */
+export type InvalidStellarAddressReason =
+  | 'not_a_string'
+  | 'empty'
+  | 'whitespace'
+  | 'wrong_length'
+  | 'invalid_characters'
+  | 'unsupported_type'
+  | 'invalid_checksum';
+
+/**
+ * Raised before any RPC call when a Stellar address (an account `G...` or,
+ * where allowed, a contract `C...` / muxed `M...` StrKey) fails validation.
+ * `field` names the offending parameter and `reason` the specific problem.
+ * `address` holds the raw (untrusted) input; the error message only includes
+ * a truncated, escaped preview of it so the value cannot inject into logs.
+ */
+export class InvalidStellarAddressError extends SoroWillError {
+  readonly field: string;
+  readonly address: string;
+  readonly reason: InvalidStellarAddressReason;
+
+  constructor(
+    field: string,
+    address: unknown,
+    reason: InvalidStellarAddressReason,
+    options?: ErrorOptions,
+  ) {
+    const raw = typeof address === 'string' ? address : String(address);
+    const preview = JSON.stringify(raw.length > 64 ? `${raw.slice(0, 64)}…` : raw);
+    super(`${field} is not a valid Stellar address (${reason.replace(/_/g, ' ')}): ${preview}`, options);
+    this.name = new.target.name;
+    this.field = field;
+    this.address = raw;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Raised when a guardian signature provided to `emergencyCheckIn` or guardian operations
+ * is invalid: empty, malformed, incorrect length, or not a valid Ed25519 or DecoratedSignature format.
+ */
+export class InvalidGuardianSignatureError extends SoroWillError {
+  readonly signature?: string | undefined;
+
+  constructor(signature?: string, message?: string, options?: ErrorOptions) {
+    super(
+      message ??
+        `Invalid guardian signature: signature must not be empty and must be a valid 64-byte Ed25519 signature or decorated signature.`,
+      options,
+    );
+    this.name = new.target.name;
+    this.signature = signature;
+  }
+}
+
 /**
  * Raised when the connected wallet's active network does not match the
  * network {@link SoroWillClient} was configured with — e.g. Freighter is set
@@ -363,12 +550,29 @@ export class WalletNetworkMismatchError extends SoroWillError {
 
   constructor(expectedNetworkPassphrase: string, actualNetworkPassphrase: string, options?: ErrorOptions) {
     super(
-      `The connected wallet is on network "${actualNetworkPassphrase}", but this client is configured for "${expectedNetworkPassphrase}". Switch the wallet's network or reconfigure the client before signing.`,
+      `The connected wallet is on network ${describeNetworkPassphrase(actualNetworkPassphrase)}, but this client is configured for ${describeNetworkPassphrase(expectedNetworkPassphrase)}. Switch the wallet's network or reconfigure the client before signing.`,
       options,
     );
+    this.name = new.target.name;
     this.expectedNetworkPassphrase = expectedNetworkPassphrase;
     this.actualNetworkPassphrase = actualNetworkPassphrase;
   }
+}
+
+/** Well-known Stellar network passphrases, mapped to a readable name. */
+const KNOWN_NETWORK_NAMES: Record<string, string> = {
+  'Public Global Stellar Network ; September 2015': 'mainnet',
+  'Test SDF Network ; September 2015': 'testnet',
+  'Test SDF Future Network ; October 2022': 'futurenet',
+};
+
+/** Renders a passphrase for an error message, naming well-known networks. */
+function describeNetworkPassphrase(passphrase: string): string {
+  if (!passphrase) {
+    return '(unknown — the wallet did not report a network)';
+  }
+  const name = KNOWN_NETWORK_NAMES[passphrase];
+  return name ? `${name} ("${passphrase}")` : `"${passphrase}"`;
 }
 
 /** Base class for typed errors returned by the SoroWill contract. */
@@ -694,11 +898,16 @@ export class TransactionSubmissionError extends SoroWillError {
  * Raised when the account returned by `getAccount()` is not found or has
  * never been funded on the current network. A common situation for brand-new
  * testnet addresses or mainnet addresses that have not yet received the
- * minimum XLM reserve.
+ * minimum XLM reserve. Source accounts need XLM for the reserve and transaction
+ * fees before submitting transactions. Use
+ * {@link https://friendbot.stellar.org | Friendbot} for free testnet XLM;
+ * mainnet accounts must receive real XLM.
  *
  * The `publicKey` is stored as a structured property rather than being
  * embedded in the message so callers can decide how to handle it (e.g.
  * redacting or hashing it before forwarding to an error-tracking service).
+ *
+ * @see https://developers.stellar.org/docs/learn/fundamentals/lumens
  */
 export class AccountNotFundedError extends SoroWillError {
   /** The Stellar public key whose account could not be loaded. */
@@ -707,7 +916,9 @@ export class AccountNotFundedError extends SoroWillError {
   constructor(publicKey: string, options?: ErrorOptions) {
     super(
       `The Stellar account for the connected wallet has not been funded on this network. ` +
-        `Fund the account with the minimum XLM reserve before submitting transactions.`,
+        `Fund the account with XLM for the minimum reserve and transaction fees before submitting transactions. ` +
+        `For free testnet XLM, visit https://friendbot.stellar.org (testnet only). ` +
+        `On mainnet, transfer real XLM to the account. See https://developers.stellar.org/docs/learn/fundamentals/lumens.`,
       options,
     );
     this.publicKey = publicKey;
@@ -750,10 +961,35 @@ export class InvalidCursorError extends SoroWillError {
    * untrusted before logging.
    */
   readonly cursor: string;
+  /** Human-readable explanation of why the cursor was rejected, if known. */
+  readonly reason: string | undefined;
 
-  constructor(cursor: string, options?: ErrorOptions) {
-    super('Invalid pagination cursor', options);
+  constructor(cursor: string, reason?: string, options?: ErrorOptions) {
+    super(reason ? `Invalid pagination cursor: ${reason}` : 'Invalid pagination cursor', options);
     this.cursor = cursor;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Raised when `subscribeToEvents` is given an `eventTypes` filter containing
+ * values outside the supported Soroban event type enum. Without this check an
+ * invalid type would produce a subscription that silently matches nothing.
+ */
+export class InvalidEventTypeFilterError extends SoroWillError {
+  /** The filter entries that are not supported event types. */
+  readonly invalidTypes: unknown[];
+  /** The event types that are accepted in a filter. */
+  readonly supportedTypes: readonly string[];
+
+  constructor(invalidTypes: unknown[], supportedTypes: readonly string[], options?: ErrorOptions) {
+    super(
+      `Invalid event type filter: ${invalidTypes.map((t) => JSON.stringify(t) ?? String(t)).join(', ')}. ` +
+        `Supported event types are: ${supportedTypes.join(', ')}.`,
+      options,
+    );
+    this.invalidTypes = invalidTypes;
+    this.supportedTypes = supportedTypes;
   }
 }
 

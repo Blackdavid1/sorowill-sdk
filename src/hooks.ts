@@ -92,11 +92,13 @@ export class HookManager {
 
   /** Register a hook that runs before every contract invocation. */
   onBeforeInvoke(hook: BeforeInvokeHook): void {
+    assertHookFunction('beforeInvoke', hook);
     this.registry.beforeInvoke.push(hook);
   }
 
   /** Register a hook that runs after every contract invocation. */
   onAfterInvoke(hook: AfterInvokeHook): void {
+    assertHookFunction('afterInvoke', hook);
     this.registry.afterInvoke.push(hook);
   }
 
@@ -216,5 +218,11 @@ export class HookManager {
   /** The number of registered afterInvoke hooks. */
   get afterInvokeCount(): number {
     return this.registry.afterInvoke.length;
+  }
+}
+
+function assertHookFunction(hookName: string, hook: unknown): void {
+  if (typeof hook !== 'function') {
+    throw new TypeError(`${hookName} hook must be a function, received ${hook === null ? 'null' : typeof hook}.`);
   }
 }
