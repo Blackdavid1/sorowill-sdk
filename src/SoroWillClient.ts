@@ -12,6 +12,11 @@ import {
 } from '@stellar/stellar-sdk';
 
 import {
+  computeContractSpecVersion,
+  describeContractVersionMismatch,
+  type ContractSpecVersion,
+} from './contractVersion';
+import {
   createReadCacheKey,
   ReadCache,
   type ReadCacheOptions,
@@ -305,6 +310,14 @@ export interface SoroWillClientOptions {
    * ```
    */
   specCacheTtlMs?: number;
+  /**
+   * The contract version this application was built against. When the
+   * deployed contract embeds a version in its `contractmetav0` WASM metadata
+   * and it differs from this value, a mismatch warning is logged with
+   * `console.warn` the first time the spec is loaded. See
+   * {@link SoroWillClient.contractSpecVersion}.
+   */
+  expectedContractVersion?: string;
   /** Optional override for the Soroban RPC endpoint. */
   rpcUrl?: string;
   /** Optional override for the Stellar network passphrase. */
@@ -1074,6 +1087,7 @@ export class SoroWillClient {
     this.deepFreeze = options.deepFreeze ?? false;
 
     this.specCacheTtlMs = options.specCacheTtlMs ?? Infinity;
+    this.expectedContractVersion = options.expectedContractVersion;
     if (this.specCacheTtlMs !== Infinity && (!Number.isFinite(this.specCacheTtlMs) || this.specCacheTtlMs <= 0)) {
       throw new RangeError('specCacheTtlMs must be a finite number greater than zero, or Infinity');
     }
@@ -1256,6 +1270,8 @@ export class SoroWillClient {
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
    * @throws {WillContractError} Mapped contract-level errors (e.g. InvalidPercentagesError,
    *   TooManyBeneficiariesError, ZeroAmountError).
+   * @throws {InvalidBeneficiaryAddressError} If a beneficiary address is not a valid
+   *   Stellar account address (`G...`).
    * @throws {Error} If the wallet is not connected or fails to sign.
    *
    * @example
@@ -1275,6 +1291,7 @@ export class SoroWillClient {
     params: CreateWillParams,
     options?: RequestOptions,
   ): Promise<{ willId: string; txHash: string }> {
+    assertValidBeneficiaryAddresses(params.beneficiaries);
     if (hasDuplicateBeneficiaries(params.beneficiaries)) {
       throw new BeneficiaryValidationError('Invalid beneficiaries: duplicate beneficiary addresses are not allowed.');
     }
@@ -1644,6 +1661,7 @@ export class SoroWillClient {
     options?: RequestOptions,
   ): Promise<{ txHash: string }> {
     parseWillId(params.willId);
+    assertValidBeneficiaryAddresses(params.beneficiaries);
     if (hasDuplicateBeneficiaries(params.beneficiaries)) {
       throw new BeneficiaryValidationError('Invalid beneficiaries: duplicate beneficiary addresses are not allowed.');
     }
@@ -2861,6 +2879,39 @@ export class SoroWillClient {
     return this.network;
   }
 
+  /**
+   * Version information for the deployed contract's spec, or `null` until the
+   * spec has been loaded (by any contract call, {@link getContractSpecVersion}
+   * or {@link refreshSpec}).
+   *
+   * Compare `fingerprint` across sessions to detect contract upgrades, and
+   * check `compatible` / `missingMethods` to detect an SDK/contract mismatch.
+   */
+  get contractSpecVersion(): ContractSpecVersion | null {
+    return this.specVersion;
+  }
+
+  /**
+   * Loads the contract spec if needed and returns its version information.
+   * A mismatch with this SDK (or with `expectedContractVersion`) is logged
+   * with `console.warn`.
+   */
+  async getContractSpecVersion(options?: RequestOptions): Promise<ContractSpecVersion> {
+    await this.getSpec(options);
+    return this.specVersion ?? computeContractSpecVersion(undefined);
+  }
+
+  /** Derives the spec version from a freshly loaded spec and warns once per distinct mismatch. */
+  private recordSpecVersion(spec: unknown, wasm?: Uint8Array): void {
+    const version = computeContractSpecVersion(spec, wasm);
+    this.specVersion = version;
+    const warning = describeContractVersionMismatch(version, this.expectedContractVersion);
+    if (warning !== null && !this.warnedSpecVersions.has(warning)) {
+      this.warnedSpecVersions.add(warning);
+      console.warn(warning);
+    }
+  }
+
   /** Lazily fetches and caches the contract's spec from its deployed wasm. */
   private async getSpec(
     options?: RequestOptions,
@@ -2883,9 +2934,17 @@ export class SoroWillClient {
 
     if (!this.specPromise) {
       if (this.specOverride) {
-        this.specPromise = Promise.resolve(this.specOverride) as Promise<InstanceType<typeof Spec>>;
+        this.specPromise = (Promise.resolve(this.specOverride) as Promise<InstanceType<typeof Spec>>).then(
+          (spec) => {
+            this.recordSpecVersion(spec);
+            return spec;
+          },
+        );
       } else if (this.specJsonOverride) {
-        this.specPromise = Promise.resolve(Spec.fromWasm(Buffer.from(this.specJsonOverride)));
+        const wasm = this.specJsonOverride;
+        const spec = Spec.fromWasm(Buffer.from(wasm));
+        this.recordSpecVersion(spec, wasm);
+        this.specPromise = Promise.resolve(spec);
       } else {
         // A rejected spec fetch must not stay cached forever — clear it so
         // the next call retries instead of replaying the same failure.
@@ -2899,6 +2958,7 @@ export class SoroWillClient {
             // Record when the spec was successfully resolved so TTL expiry can
             // be checked on the next call (#502).
             this.specResolvedAt = Date.now();
+            this.recordSpecVersion(spec, wasm);
             return spec;
           })
           .catch((error: unknown) => {

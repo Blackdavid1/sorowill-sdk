@@ -20,6 +20,13 @@ export type {
   SoroWillReadCacheOptions,
 } from './SoroWillClient';
 export { DEFAULT_CONTRACT_IDS } from './SoroWillClient';
+export {
+  SDK_REQUIRED_CONTRACT_METHODS,
+  computeContractSpecVersion,
+  describeContractVersionMismatch,
+  readContractMeta,
+} from './contractVersion';
+export type { ContractSpecVersion } from './contractVersion';
 
 export { HookManager } from './hooks';
 export type {
@@ -42,6 +49,10 @@ export type {
 
 export {
   buildFeeBumpXdr,
+  estimateFeeBumpFee,
+  isFeeEstimateStale,
+  refreshFeeEstimateIfStale,
+  DEFAULT_FEE_STALENESS_THRESHOLD_MS,
   signFeeBumpXdr,
   submitFeeBump,
   submitFeeBumpTransaction,
@@ -49,7 +60,9 @@ export {
   StaleTransactionSequenceError,
 } from './feeBump';
 export type {
+  EstimateFeeBumpFeeOptions,
   FeeBumpOptions,
+  FeeEstimate,
   SubmitFeeBumpOptions,
 } from './feeBump';
 
@@ -178,6 +191,7 @@ export {
   HookExecutionError,
   HookRecursionError,
   InsufficientBalanceError,
+  InvalidBeneficiaryAddressError,
   InvalidContractIdError,
   InvalidDayCountError,
   InvalidGuardianSignatureError,
@@ -292,6 +306,8 @@ export {
   isValidStellarAddress,
   toStroops,
   validateBeneficiaries,
+  describeInvalidBeneficiaryAddress,
+  assertValidBeneficiaryAddresses,
   validateGuardians,
 } from './utils';
 export type { NextActionableState, StellarAddressValidationOptions } from './utils';
