@@ -184,6 +184,8 @@ interface WebSocketLike {
 /** Options for constructing a read cache scoped to SoroWill reads. */
 export interface SoroWillReadCacheOptions {
   ttlMs?: number;
+  /** Maximum cached entries before least-recently-used eviction. Defaults to 1000. */
+  maxEntries?: number;
 }
 
 export type {
@@ -734,10 +736,53 @@ function parseCursor(cursor: string | undefined): number {
   if (cursor === undefined) {
     return 0;
   }
-  if (!/^\d+$/.test(cursor)) {
-    throw new InvalidCursorError(cursor);
+  if (typeof cursor !== 'string') {
+    throw new InvalidCursorError(String(cursor), `expected a string, received ${typeof cursor}`);
   }
-  return Number(cursor);
+  if (cursor.length === 0) {
+    throw new InvalidCursorError(cursor, 'cursor must not be empty');
+  }
+  if (!/^(0|[1-9]\d*)$/.test(cursor)) {
+    throw new InvalidCursorError(
+      cursor,
+      'expected a non-negative integer offset with no sign, decimals, whitespace, or leading zeros',
+    );
+  }
+  const offset = Number(cursor);
+  if (!Number.isSafeInteger(offset)) {
+    throw new InvalidCursorError(cursor, 'cursor offset exceeds Number.MAX_SAFE_INTEGER');
+  }
+  return offset;
+}
+
+/** Maximum accepted length of an event-stream cursor (RPC paging token). */
+const MAX_EVENT_CURSOR_LENGTH = 256;
+
+/**
+ * Validates an event-subscription cursor (an opaque RPC paging token) before
+ * it is forwarded to the RPC node or WebSocket stream. Paging tokens are
+ * short alphanumeric strings (e.g. `"0004294967296-0000000001"`), so the
+ * SDK only accepts non-empty strings of letters, digits, `-` and `_`.
+ */
+function validateEventCursor(cursor: unknown): void {
+  if (cursor === undefined) {
+    return;
+  }
+  if (typeof cursor !== 'string') {
+    throw new InvalidCursorError(String(cursor), `expected a string, received ${typeof cursor}`);
+  }
+  if (cursor.length === 0) {
+    throw new InvalidCursorError(cursor, 'cursor must not be empty');
+  }
+  if (cursor.length > MAX_EVENT_CURSOR_LENGTH) {
+    throw new InvalidCursorError(
+      cursor,
+      `cursor must be at most ${MAX_EVENT_CURSOR_LENGTH} characters`,
+    );
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(cursor)) {
+    throw new InvalidCursorError(cursor, 'cursor may only contain letters, digits, "-" and "_"');
+  }
 }
 
 function normalizePositiveInteger(value: number | undefined, label: string): number | null {
@@ -1856,6 +1901,8 @@ export class SoroWillClient {
     owner: string,
     options?: (PaginationOptions & RequestOptions) | RequestOptions,
   ): Promise<Will[] | PaginatedWillsResult> {
+    // #612: reject malformed addresses before they reach the cache key or RPC.
+    assertValidStellarAddress(owner, 'owner', { allowContract: true });
     const paginationOptions = options as PaginationOptions | undefined;
     if (paginationOptions?.cursor !== undefined) {
       parseCursor(paginationOptions.cursor);
@@ -1924,6 +1971,8 @@ export class SoroWillClient {
     beneficiary: string,
     options?: (PaginationOptions & RequestOptions) | RequestOptions,
   ): Promise<Will[] | PaginatedWillsResult> {
+    // #612: reject malformed addresses before they reach the cache key or RPC.
+    assertValidStellarAddress(beneficiary, 'beneficiary', { allowContract: true });
     const paginationOptions = options as PaginationOptions | undefined;
     if (paginationOptions?.cursor !== undefined) {
       parseCursor(paginationOptions.cursor);
@@ -2121,10 +2170,10 @@ export class SoroWillClient {
    * console.log(`Batch operation txHash: ${result.txHash}`);
    * ```
    */
-  async batch(
-    operations: readonly BatchOperation[],
+  async batch<const TOperations extends readonly BatchOperation[]>(
+    operations: TOperations,
     options?: RequestOptions,
-  ): Promise<BatchResult> {
+  ): Promise<BatchResult<TOperations>> {
     if (operations.length === 0) {
       throw new RangeError('A batch must contain at least one operation');
     }
@@ -2195,7 +2244,20 @@ export class SoroWillClient {
         const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
         const result = await this.submitSignedTransaction(signedTxXdr, options);
         txHash = result.txHash;
-        return { success: true, txHash: result.txHash, createdAt: result.createdAt };
+        // Soroban allows a single invocation per transaction, so the
+        // transaction's return value belongs to the (only) operation.
+        const results = operations.map(({ method, args, decode }) => {
+          const native =
+            result.returnValue === undefined ? undefined : spec.funcResToNative(method, result.returnValue);
+          return { method, args, returnValue: decode ? decode(native) : native };
+        }) as BatchOperationResults<TOperations>;
+        const batchResult: BatchResult<TOperations> = {
+          success: true,
+          txHash: result.txHash,
+          createdAt: result.createdAt,
+          results,
+        };
+        return batchResult;
       });
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);

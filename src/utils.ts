@@ -1,6 +1,10 @@
 import { StrKey } from '@stellar/stellar-sdk';
 
-import { BeneficiaryValidationError } from './errors';
+import {
+  BeneficiaryValidationError,
+  InvalidStellarAddressError,
+  type InvalidStellarAddressReason,
+} from './errors';
 import type { Beneficiary, Will } from './types';
 import { WillStatus } from './types';
 

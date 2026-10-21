@@ -457,6 +457,44 @@ export class GuardianValidationError extends SoroWillError {
   }
 }
 
+/** Why a value was rejected by {@link InvalidStellarAddressError}. */
+export type InvalidStellarAddressReason =
+  | 'not_a_string'
+  | 'empty'
+  | 'whitespace'
+  | 'wrong_length'
+  | 'invalid_characters'
+  | 'unsupported_type'
+  | 'invalid_checksum';
+
+/**
+ * Raised before any RPC call when a Stellar address (an account `G...` or,
+ * where allowed, a contract `C...` / muxed `M...` StrKey) fails validation.
+ * `field` names the offending parameter and `reason` the specific problem.
+ * `address` holds the raw (untrusted) input; the error message only includes
+ * a truncated, escaped preview of it so the value cannot inject into logs.
+ */
+export class InvalidStellarAddressError extends SoroWillError {
+  readonly field: string;
+  readonly address: string;
+  readonly reason: InvalidStellarAddressReason;
+
+  constructor(
+    field: string,
+    address: unknown,
+    reason: InvalidStellarAddressReason,
+    options?: ErrorOptions,
+  ) {
+    const raw = typeof address === 'string' ? address : String(address);
+    const preview = JSON.stringify(raw.length > 64 ? `${raw.slice(0, 64)}…` : raw);
+    super(`${field} is not a valid Stellar address (${reason.replace(/_/g, ' ')}): ${preview}`, options);
+    this.name = new.target.name;
+    this.field = field;
+    this.address = raw;
+    this.reason = reason;
+  }
+}
+
 /**
  * Raised when a guardian signature provided to `emergencyCheckIn` or guardian operations
  * is invalid: empty, malformed, incorrect length, or not a valid Ed25519 or DecoratedSignature format.
@@ -898,10 +936,13 @@ export class InvalidCursorError extends SoroWillError {
    * untrusted before logging.
    */
   readonly cursor: string;
+  /** Human-readable explanation of why the cursor was rejected, if known. */
+  readonly reason: string | undefined;
 
-  constructor(cursor: string, options?: ErrorOptions) {
-    super('Invalid pagination cursor', options);
+  constructor(cursor: string, reason?: string, options?: ErrorOptions) {
+    super(reason ? `Invalid pagination cursor: ${reason}` : 'Invalid pagination cursor', options);
     this.cursor = cursor;
+    this.reason = reason;
   }
 }
 

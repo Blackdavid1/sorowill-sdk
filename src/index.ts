@@ -135,6 +135,7 @@ export {
   IndexedDbCachePersistenceAdapter,
   LocalStorageCachePersistenceAdapter,
   MemoryCachePersistenceAdapter,
+  DEFAULT_MAX_CACHE_ENTRIES,
   ReadCache,
   createReadCacheKey,
   escapeCacheKeyComponent,
@@ -190,6 +191,7 @@ export {
   InvalidSecretKeyError,
   InvalidSignedXdrEncodingError,
   InvalidSplitError,
+  InvalidStellarAddressError,
   InvalidTokenError,
   InvalidTransactionXdrError,
   InvokeFailedError,
@@ -234,7 +236,7 @@ export {
   UnsupportedBatchSizeError,
   UnknownContractErrorCodeError,
 } from './errors';
-export type { ContractErrorFactory } from './errors';
+export type { ContractErrorFactory, InvalidStellarAddressReason } from './errors';
 
 export {
   DEFAULT_MAX_QUEUE_SIZE,
@@ -274,22 +276,25 @@ export type {
 export {
   MAX_BENEFICIARIES,
   MAX_GUARDIANS,
+  assertValidStellarAddress,
   calculateShares,
   deepFreezeObject,
   formatDeadline,
   formatTokenAmount,
   formatUSDC,
   getNextActionableState,
+  getStellarAddressError,
   getTimeUntilCheckin,
   hasDuplicateBeneficiaries,
   isBeneficiary,
   isCheckinDue,
   isGuardian,
+  isValidStellarAddress,
   toStroops,
   validateBeneficiaries,
   validateGuardians,
 } from './utils';
-export type { NextActionableState } from './utils';
+export type { NextActionableState, StellarAddressValidationOptions } from './utils';
 
 export {
   DEFAULT_NETWORK,

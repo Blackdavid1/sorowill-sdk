@@ -382,8 +382,25 @@ export interface BatchOperation {
   network?: 'testnet' | 'mainnet';
 }
 
-export interface BatchResult {
+/** Maps a tuple of operations to a tuple of their typed results, preserving order and length. */
+export type BatchOperationResults<TOperations extends readonly BatchOperation[]> = {
+  -readonly [K in keyof TOperations]: TOperations[K] extends BatchOperation
+    ? BatchOperationResult<TOperations[K]>
+    : never;
+};
+
+/**
+ * Result of a successful {@link SoroWillClient.batch} submission. `results`
+ * has one entry per submitted operation, each typed from its operation.
+ */
+export interface BatchResult<
+  TOperations extends readonly BatchOperation[] = readonly BatchOperation[],
+> {
   success: boolean;
+  txHash: string;
+  /** Ledger close time of the submitted transaction, in Unix seconds. */
+  createdAt: number;
+  results: BatchOperationResults<TOperations>;
   error?: Error;
 }
 
