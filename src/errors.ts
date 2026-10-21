@@ -372,6 +372,30 @@ export class InvalidTransactionXdrError extends SoroWillError {
 }
 
 /**
+ * Raised when a wallet signer returns a signed transaction that is not valid
+ * base64. Stellar transaction envelopes are always standard (RFC 4648),
+ * padded base64-encoded XDR, so anything else would only fail later — and
+ * far more cryptically — when the envelope is decoded or submitted to the
+ * contract.
+ *
+ * The offending value is intentionally not embedded in the message; only its
+ * length is kept so the error is safe to forward to error-tracking pipelines.
+ */
+export class InvalidSignedXdrEncodingError extends SoroWillError {
+  /** Length of the rejected XDR string. */
+  readonly length: number;
+
+  constructor(length: number, options?: ErrorOptions) {
+    super(
+      'Wallet signer returned a signed transaction XDR that is not valid base64. ' +
+        'Expected a standard, padded base64-encoded TransactionEnvelope.',
+      options,
+    );
+    this.length = length;
+  }
+}
+
+/**
  * Raised when the wallet's `signTransaction` call does not resolve within the
  * configured timeout. This can happen when the Freighter popup is dismissed in
  * a way that leaves the underlying promise pending, or when the extension hangs.
@@ -878,6 +902,28 @@ export class InvalidCursorError extends SoroWillError {
   constructor(cursor: string, options?: ErrorOptions) {
     super('Invalid pagination cursor', options);
     this.cursor = cursor;
+  }
+}
+
+/**
+ * Raised when `subscribeToEvents` is given an `eventTypes` filter containing
+ * values outside the supported Soroban event type enum. Without this check an
+ * invalid type would produce a subscription that silently matches nothing.
+ */
+export class InvalidEventTypeFilterError extends SoroWillError {
+  /** The filter entries that are not supported event types. */
+  readonly invalidTypes: unknown[];
+  /** The event types that are accepted in a filter. */
+  readonly supportedTypes: readonly string[];
+
+  constructor(invalidTypes: unknown[], supportedTypes: readonly string[], options?: ErrorOptions) {
+    super(
+      `Invalid event type filter: ${invalidTypes.map((t) => JSON.stringify(t) ?? String(t)).join(', ')}. ` +
+        `Supported event types are: ${supportedTypes.join(', ')}.`,
+      options,
+    );
+    this.invalidTypes = invalidTypes;
+    this.supportedTypes = supportedTypes;
   }
 }
 
