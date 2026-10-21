@@ -53,10 +53,18 @@ export type {
   SubmitFeeBumpOptions,
 } from './feeBump';
 
-export { SimulationResultError } from './txValidation';
+export {
+  SimulationResultError,
+  UnsupportedSignatureAlgorithmError,
+  assertSupportedSignatureAlgorithm,
+  assertSignedTransactionXdrSignatures,
+  ED25519_SIGNATURE_LENGTH,
+} from './txValidation';
 export type {
   SimulationResponse,
   TransactionMatchOptions,
+  SignatureValidationOptions,
+  SignedTransactionLike,
 } from './txValidation';
 
 export type {
@@ -231,6 +239,9 @@ export {
   RequestPriority,
   getSharedRequestQueue,
   releaseSharedRequestQueue,
+  computeBackoffDelay,
+  isRateLimitError,
+  MAX_BACKOFF_MS,
 } from './requestQueue';
 export type { RequestQueueOptions } from './requestQueue';
 

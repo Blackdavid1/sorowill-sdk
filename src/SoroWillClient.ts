@@ -467,6 +467,38 @@ const DEFAULT_RETRY_OPTIONS: RpcRetryOptions = {
  * corrupted `Will`: verifies the value decoded by `funcResToNative` actually
  * has the shape this SDK expects before any of its fields are trusted.
  */
+/**
+ * Settles with `promise`, or rejects with the signal's abort reason as soon as
+ * `signal` fires — whichever happens first. Lets callers stop waiting on a
+ * long-running step (wallet signing, an in-flight RPC) the moment they abort
+ * instead of waiting for it to time out (#608).
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    // The original promise is abandoned; keep its eventual rejection handled.
+    promise.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      promise.catch(() => undefined);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function isRawWillShape(value: unknown): value is RawWill {
   if (typeof value !== 'object' || value === null) {
     return false;
@@ -2812,7 +2844,7 @@ export class SoroWillClient {
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
 
     const willId = args.will_id === undefined ? undefined : String(args.will_id);
-    const run = async (): Promise<{
+    const execute = async (options: RequestOptions | undefined): Promise<{
       txHash: string;
       createdAt: number;
       returnValue: ScVal | undefined;
@@ -3025,6 +3057,7 @@ export class SoroWillClient {
           'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
         );
       }
+      assertSupportedSignatureAlgorithm(signedTx, { context: label });
 
       options?.signal?.throwIfAborted();
       // Failover only retries connection-level errors (see RpcEndpointPool). Re-sending the
@@ -3099,6 +3132,7 @@ export class SoroWillClient {
               'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
             );
           }
+          assertSupportedSignatureAlgorithm(feeBumpSignedTx, { context: `${label} (fee bump)` });
 
           const feeBumpResponse = await this.rpc(
             () => this.rpcPool.withFailover((server) => server.sendTransaction(feeBumpSignedTx)),
@@ -3257,6 +3291,7 @@ export class SoroWillClient {
         'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
       );
     }
+    assertSupportedSignatureAlgorithm(signedTx, { context: 'submitSignedTransaction' });
     const publicKey = await this.getWalletPublicKey();
     await this.rpc(
       () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),
