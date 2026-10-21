@@ -893,6 +893,10 @@ export class SoroWillClient {
   private readonly signedTransactionHashes: Set<string>;
 
   constructor(options: SoroWillClientOptions) {
+    // Stellar SDK names its contract StrKey validator isValidContract.
+    if (typeof options.contractId !== 'string' || !StrKey.isValidContract(options.contractId)) {
+      throw new InvalidContractIdError(options.contractId ?? '');
+    }
     const config = NETWORK_CONFIG[options.network];
     const rpcUrl = options.rpcUrl ?? config.rpcUrls[0]!;
 
